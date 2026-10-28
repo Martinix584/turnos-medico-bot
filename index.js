@@ -14,8 +14,8 @@ const aqui = (p) => fileURLToPath(new URL(p, import.meta.url));
 try { process.loadEnvFile(aqui("./.env")); } catch {} // funciona aunque el autoarranque corra desde otra carpeta
 
 const { clasificar } = await import("./lib/clasificar.js");
-// Por defecto el árbol de decisión (sin IA). MODO=ia usa una IA compatible con OpenAI.
-const motor = process.env.MODO === "ia" ? await import("./lib/ia.js") : await import("./lib/arbol.js");
+// Motor: el menú (arbol.js) atiende casi todo; la IA (ia.js) entra sola, sin avisar, cuando el menú no entiende.
+const motor = await import("./lib/arbol.js");
 const estado = await import("./lib/estado.js");
 const { habilitado } = await import("./lib/tel.js");
 const { cfg, activo } = await import("./lib/config.js");
@@ -25,7 +25,9 @@ const panel = await import("./lib/panel.js");
 
 // Config completa al arrancar: si falta algo, mejor no conectar que pausar todos los chats en silencio.
 try {
-  for (const k of ["sedes", "turnoMin", "calendarId", "consultorio", "motivos", ...(process.env.MODO === "ia" ? ["llm"] : [])]) if (cfg[k] === undefined || Number.isNaN(cfg[k])) throw new Error(`${k} inválido`);
+  for (const k of ["sedes", "turnoMin", "calendarId", "consultorio", "sedeClinica", "sedeEstudios", "mailRecetas", "llm"]) if (cfg[k] === undefined || Number.isNaN(cfg[k])) throw new Error(`${k} inválido`);
+  // Una sede mal escrita (o con acentos rotos) haría fallar cada reserva en silencio: mejor no arrancar.
+  for (const s of [cfg.sedeClinica, cfg.sedeEstudios]) if (!cfg.sedes.some((x) => x.nombre === s)) throw new Error(`la sede "${s}" no está en SEDES`);
   if (!process.env.GOOGLE_SA_JSON) throw new Error("Falta la variable GOOGLE_SA_JSON en .env");
   JSON.parse(process.env.GOOGLE_SA_JSON);
 } catch (e) {
