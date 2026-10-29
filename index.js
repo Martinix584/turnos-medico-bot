@@ -22,6 +22,8 @@ const { cfg, activo } = await import("./lib/config.js");
 const agenda = await import("./lib/agenda.js");
 const { recordatorio } = await import("./lib/arbol.js");
 const panel = await import("./lib/panel.js");
+const avisos = await import("./lib/avisos.js");
+const bandeja = await import("./lib/bandeja.js");
 
 // Config completa al arrancar: si falta algo, mejor no conectar que pausar todos los chats en silencio.
 try {
@@ -78,21 +80,46 @@ async function manejar(sock, m) {
     r = await motor.atender({ tel, clave, texto: c.texto });
   } catch (e) {
     console.error("error respondiendo:", e.message);
-    return estado.pausar(clave, cfg.pausaHoras); // que lo vea una persona; al paciente no se le dice nada raro
+    estado.pausar(clave, cfg.pausaHoras); // que lo vea una persona; al paciente no se le dice nada
+    // Aviso a la secretaria en el panel (http://127.0.0.1:3000).
+    const que = e.message.startsWith("LLM") ? "falló la IA" : e.message.startsWith("Calendar") ? "falló Google Calendar" : "error del bot";
+    return avisos.avisar(tel, que, e.message.slice(0, 200));
   }
   if (r.texto) await enviar(sock, c.jid, r.texto);
   if (r.derivar) estado.pausar(clave, cfg.pausaHoras);
 }
 
-// Recordatorios del panel: de a uno, con 20-45 s entre mensajes (poco volumen, ritmo humano).
-async function recordar(fecha) {
+async function capturar(sock, m) {
+  const r = bandeja.leer(m);
+  if (!r) return;
+  const tel = await telefono(sock, m.key);
+  if (!tel) return;
+  bandeja.guardar({ ...r, tel, de: !r.fromMe ? "paciente" : enviados.has(r.id) ? "bot" : "celular" });
+}
+
+// Respuesta escrita en el panel: sale aunque BOT_ACTIVO=0 (la escribió una persona). La pausa la pone el panel.
+async function responder(tel, texto, quien) {
+  if (!sockActual?.user) throw new Error("WhatsApp no está conectado");
+  const id = generateMessageIDV2(sockActual.user.id);
+  enviados.set(id, { conversation: texto });
+  await sockActual.sendMessage(`${tel}@s.whatsapp.net`, { text: texto }, { messageId: id });
+  bandeja.guardar({ id, tel, at: Date.now(), de: "panel", texto, quien });
+}
+
+// Recordatorios: de a uno, con 20-45 s entre mensajes (poco volumen, ritmo humano).
+// auto: el envío automático del día anterior (solo turnos del bot y sin tocar chats en pausa).
+async function recordar(fecha, auto = false) {
   if (!sockActual?.user) return "WhatsApp no está conectado. Esperá un minuto y probá de nuevo.";
   if (mandando) return "Ya se están mandando recordatorios.";
   mandando = true; // antes del await: un doble clic no arranca dos envíos
   let turnos;
-  try { turnos = panel.pendientes(await agenda.turnosDelDia(fecha)); } catch (e) { mandando = false; throw e; }
+  try {
+    const delDia = await agenda.turnosDelDia(fecha);
+    turnos = auto ? panel.pendientesAuto(delDia, estado.pausado) : panel.pendientes(delDia);
+  } catch (e) { mandando = false; throw e; }
   (async () => {
     for (const t of turnos) {
+      if (auto && estado.pausado(t.tel)) continue; // la secretaria lo tomó mientras tanto
       try {
         await enviar(sockActual, `${t.tel}@s.whatsapp.net`, recordatorio(t.tel, t));
         await agenda.marcar(t.evento, { recordado: "1" });
@@ -133,10 +160,23 @@ async function conectar() {
     }
   });
   sock.ev.on("messages.upsert", ({ messages, type }) => {
-    if (gen !== generacion || type !== "notify") return;
+    if (gen !== generacion) return;
+    // Bandeja del panel: todo, también lo que manda este mismo socket (llega como "append").
+    for (const m of messages) capturar(sock, m).catch((e) => console.error("bandeja:", e.message));
+    if (type !== "notify") return;
     for (const m of messages) cola = cola.then(() => manejar(sock, m)).catch((e) => console.error("error:", e.message));
   });
 }
 
-panel.servir({ puerto: Number(process.env.PANEL_PUERTO) || 3000, enviar: recordar });
+panel.servir({ puerto: Number(process.env.PANEL_PUERTO) || 3000, enviar: recordar, responder });
+
+// RECORDAR_HORA (ej. 16): cada 10 min, si es hora, manda los recordatorios de mañana. Una vez por
+// fecha en este proceso; si se reinicia, los ya enviados quedan marcados "recordado" y no se repiten.
+let recordadoAuto = "";
+if (process.env.RECORDAR_HORA) setInterval(async () => {
+  const fecha = panel.fechaParaRecordar(Date.now(), Number(process.env.RECORDAR_HORA));
+  if (!fecha || fecha === recordadoAuto || !sockActual?.user || mandando) return;
+  try { recordadoAuto = fecha; console.log(`recordatorios automáticos para ${fecha}:`, await recordar(fecha, true)); }
+  catch (e) { recordadoAuto = ""; console.error("recordatorios automáticos:", e.message); }
+}, 10 * 60e3);
 conectar().catch((e) => { console.error("no se pudo conectar:", e); process.exit(1); });

@@ -3,3 +3,8 @@ node_modules
 auth/
 chats.json
 chats.json.tmp
+avisos.json
+avisos.json.tmp
+bandeja.db
+bandeja.db-*
+bot.log

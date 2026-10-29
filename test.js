@@ -1,6 +1,6 @@
 // node test.js — sin red.
 import assert from "node:assert";
-import { libres as libresSedes, idTurno, msDeId, rangoBusqueda, intervalo, hora, validarSedes, turnosDelMes, conCupo } from "./lib/slots.js";
+import { libres as libresSedes, idTurno, msDeId, rangoBusqueda, intervalo, hora, validarSedes, turnosDelMes, conCupo, linkCalendar } from "./lib/slots.js";
 import { clasificar, VIEJO_SEG } from "./lib/clasificar.js";
 import { normalizarTel } from "./lib/tel.js";
 import { jwt } from "./lib/google.js";
@@ -8,7 +8,10 @@ import { generateKeyPairSync, createVerify } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
-process.env.CHATS_JSON = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "turnos-")), "chats.json"); // no tocar el chats.json real
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "turnos-"));
+process.env.CHATS_JSON = path.join(tmp, "chats.json"); // no tocar el chats.json real
+process.env.AVISOS_JSON = path.join(tmp, "avisos.json");
+process.env.BANDEJA_DB = path.join(tmp, "bandeja.db");
 
 // Una sede con esos horarios; devuelve solo los inicios.
 const libres = ({ horarios, ...o }) => libresSedes({ ...o, sedes: [{ nombre: "S", horarios }] }).map((x) => x.t);
@@ -87,6 +90,12 @@ assert.strictEqual(turnosDelMes(SEDES[0], "2026-11", 30), 8 * 11); // 4 martes +
   assert.deepStrictEqual(f({ "2026-10": 59 }), ["2026-11-03T09:30", "2026-10-28T09:30"]); // octubre lleno: pasa a noviembre; Sede Norte no cuenta
   assert.deepStrictEqual(f({ "2026-10": 59, "2026-11": 52 }), ["2026-10-28T09:30"]); // 60% de 88 = 52
 }
+// Link "agregar a Google Calendar": 11:00 hora argentina, 30 min => 14:00 a 14:30 UTC
+{
+  const u = new URL(linkCalendar({ t: Date.parse("2026-11-05T11:00:00-03:00"), min: 30, titulo: "Turno con la Dra. X", lugar: "Sede Centro", detalle: "d" }));
+  assert.deepStrictEqual([u.host, u.searchParams.get("action"), u.searchParams.get("dates"), u.searchParams.get("text"), u.searchParams.get("location")],
+    ["calendar.google.com", "TEMPLATE", "20261105T140000Z/20261105T143000Z", "Turno con la Dra. X", "Sede Centro"]);
+}
 // JWT de Google: clave con "\n" literales (como queda a veces en un secret), firma verificable
 const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const pemEscapado = privateKey.export({ type: "pkcs8", format: "pem" }).replace(/\n/g, "\\n");
@@ -151,7 +160,8 @@ assert.strictEqual(clasificar(msg({}, { ephemeralMessage: { message: { conversat
     return json({ choices: [{ message: { role: "assistant", content: null, ...sig } }] });
   };
   const r = await responder("5492611234567", [{ role: "user", content: "turno en sede norte, soy Ana Pérez" }]);
-  assert.deepStrictEqual(r, { texto: "Listo Ana, te espero en Sede Norte.", derivar: undefined });
+  assert.strictEqual(r.derivar, undefined);
+  assert.match(r.texto, /^Listo Ana, te espero en Sede Norte\.\n\n🗓️ Guardalo en tu calendario: https:\/\/calendar\.google\.com\/calendar\/render\?action=TEMPLATE&/); // el link lo agrega el código
   assert.strictEqual(pedidos.length, 4);
   assert.deepStrictEqual(pedidos[0].tools.map((t) => t.function.name), ["turnos_libres", "mis_turnos", "reservar", "cancelar", "derivar"]);
   const libres = JSON.parse(pedidos[1].messages.at(-1).content);
@@ -203,11 +213,13 @@ assert.strictEqual(clasificar(msg({}, { ephemeralMessage: { message: { conversat
   const dice = async (texto, t = tel) => (await atender({ tel: t, clave: t, texto })).texto;
   assert.match(await dice("hola, quería un turno"), /asistente de turnos de la Dra\. Prueba[\s\S]*1\) Control clínico[\s\S]*4\) Empadronamiento[\s\S]*6\) Ver o cancelar[\s\S]*107/);
   assert.match(await dice("1"), /Días con turnos en Sede Centro:\n1\) (martes|jueves) /); // control clínico => Centro, sin preguntar sede
-  assert.match(await dice("1"), /Horarios del .* en Sede Centro:\n1\) 08:30\n2\) 09:30\n3\) 10:00\n4\) 10:30/);
+  assert.match(await dice("2"), /Horarios del .* en Sede Centro:\n1\) 08:30\n2\) 09:30\n3\) 10:00\n4\) 10:30/); // día 2: el 1 puede ser hoy, con horas ya pasadas
   assert.match(await dice("3"), /nombre y apellido y tu número de DNI/);
   assert.match(await dice("Ana"), /No llegué a leer bien/); // un reintento
   assert.match(await dice("Ana Pérez 25.123.456"), /a las 10:00[\s\S]*Sede Centro[\s\S]*Control clínico[\s\S]*Ana Pérez · DNI 25123456[\s\S]*1\) Confirmar/);
-  assert.match(await dice("1"), /✅ Listo, tu turno quedó reservado/);
+  const ok = await dice("1");
+  assert.match(ok, /✅ Listo, tu turno quedó reservado[\s\S]*Guardalo en tu calendario: https:\/\/calendar\.google\.com\/[^\s]*location=Sede\+Centro/);
+  assert.doesNotMatch(ok, /25123456|Cómo llegar/); // el link no lleva DNI; sin "mapa" en SEDES no hay "Cómo llegar"
   assert.strictEqual(eventos.length, 1);
   assert.deepStrictEqual([eventos[0].location, eventos[0].summary], ["Sede Centro", "Turno: Ana Pérez (Sede Centro)"]);
   assert.match(eventos[0].description, /^DNI 25123456\nMotivo: Control clínico\nPedido por WhatsApp desde \+5492611234567$/);
@@ -216,11 +228,28 @@ assert.strictEqual(clasificar(msg({}, { ephemeralMessage: { message: { conversat
   assert.strictEqual(pedidosIA.length, 0); // todo lo anterior lo resolvió el menú, sin IA
 
   assert.strictEqual(await dice("gracias!!"), ""); // después de terminar, silencio
+  assert.strictEqual(await dice("Ok dale, muchas gracias doctora 🙏"), "");
+  assert.strictEqual(await dice("👍"), "");
+  assert.strictEqual(pedidosIA.length, 0);
+  assert.strictEqual(await dice("y atienden por obra social?"), "Claro, te ayudo con eso."); // pregunta después de terminar => IA
+  assert.strictEqual(pedidosIA.length, 1);
+  assert.match(await dice("0"), /1\) Control clínico/); // de la IA se vuelve al menú
+  pedidosIA.length = 0;
   assert.match(await dice("1"), /Ya tenés un turno el .* a las 10:00 en Sede Centro/);
   assert.match(await dice("6"), /Tus turnos:\n1\) .* a las 10:00 \(Sede Centro\)/);
   assert.match(await dice("1"), /¿Cancelo el turno/);
   assert.match(await dice("1"), /Listo, cancelé el turno/);
   assert.strictEqual(eventos.length, 0);
+
+  // Con "mapa" en la sede, la confirmación y el recordatorio dicen cómo llegar
+  {
+    const ag = await import("./lib/agenda.js");
+    const conMapa = SEDES.map((s) => ({ ...s, mapa: `https://maps.app.goo.gl/${s.nombre.replace(" ", "")}` }));
+    process.env.SEDES = JSON.stringify(conMapa);
+    assert.match(ag.extrasTurno(Date.now(), "Sede Centro"), /^\n📍 Cómo llegar: https:\/\/maps\.app\.goo\.gl\/SedeCentro\n🗓️ Guardalo/);
+    assert.strictEqual(ag.extrasTurno(Date.now(), "Sede Norte", { calendario: false }), "\n📍 Cómo llegar: https://maps.app.goo.gl/SedeNorte");
+    process.env.SEDES = JSON.stringify(SEDES);
+  }
 
   // Control de estudios => Sede Norte (solo miércoles); empadronamiento => Centro
   const est = "5492610000001";
@@ -320,8 +349,52 @@ assert.strictEqual(clasificar(msg({}, { ephemeralMessage: { message: { conversat
   const turnos = await agenda.turnosDelDia("2026-10-27");
   assert.deepStrictEqual(turnos.map((t) => [t.nombre, t.tel]), [["Juan <b>Gómez</b>", "5492615551234"], ["Ana Pérez", "5492611234567"], ["Sin datos", null]]);
   assert.strictEqual(pendientes(turnos).length, 2);
+  // automático: solo el turno que sacó el paciente por el bot, y no si el chat está en pausa
+  const { pendientesAuto, fechaParaRecordar } = await import("./lib/panel.js");
+  assert.deepStrictEqual(pendientesAuto(turnos, () => false).map((t) => t.nombre), ["Ana Pérez"]);
+  assert.deepStrictEqual(pendientesAuto(turnos, () => true), []);
+  assert.strictEqual(fechaParaRecordar(Date.parse("2026-11-02T15:59:00-03:00"), 16), null);
+  assert.strictEqual(fechaParaRecordar(Date.parse("2026-11-02T16:00:00-03:00"), 16), "2026-11-03"); // lunes 16 h → martes
+  assert.strictEqual(fechaParaRecordar(Date.parse("2026-11-02T20:59:00-03:00"), 16), "2026-11-03");
+  assert.strictEqual(fechaParaRecordar(Date.parse("2026-11-02T21:00:00-03:00"), 16), null); // a la noche no
   const html = pagina({ fecha: "2026-10-27", turnos, aviso: "" });
   assert.match(html, /Juan &#60;b&#62;Gómez/); assert.match(html, /sin teléfono/); assert.match(html, /Enviar recordatorios \(2\)/);
+  assert.doesNotMatch(html, /no pudo responder/); // sin avisos, no aparece la sección
+
+  // Avisos: el bot no pudo responder → aparece en el panel hasta que la secretaria toca "Listo"
+  const avisos = await import("./lib/avisos.js");
+  avisos.avisar("5492611234567", "falló la IA", "LLM 402: <sin crédito>");
+  const [al] = avisos.pendientes();
+  const conAviso = pagina({ fecha: "2026-10-27", turnos, aviso: "", alertas: avisos.pendientes() });
+  assert.match(conAviso, /<title>\(1\) Recordatorios/);
+  assert.match(conAviso, /no pudo responder \(1\)[\s\S]*\+5492611234567[\s\S]*falló la IA/);
+  assert.match(conAviso, /&#60;sin crédito&#62;/); // el detalle va escapado
+  avisos.listo(al.id);
+  assert.strictEqual(avisos.pendientes().length, 0);
+  assert.strictEqual(JSON.parse(fs.readFileSync(process.env.AVISOS_JSON, "utf8")).length, 1); // queda guardado (7 días), marcado listo
+
+  // Con el Calendar caído el panel igual muestra los avisos y se sigue refrescando
+  {
+    const { servir } = await import("./lib/panel.js");
+    const http = await import("node:http");
+    avisos.avisar("5492619990000", "falló Google Calendar");
+    const antes = globalThis.fetch;
+    globalThis.fetch = async () => new Response("caído", { status: 503 });
+    const puerto = 30000 + Math.floor(Math.random() * 20000);
+    const srv = servir({ puerto, enviar: async () => "" });
+    await new Promise((r) => setTimeout(r, 200));
+    const html = await new Promise((ok, mal) => http.get({ host: "127.0.0.1", port: puerto, path: "/" }, (r) => { let b = ""; r.on("data", (c) => (b += c)); r.on("end", () => ok([r.statusCode, b])); }).on("error", mal));
+    // por Tailscale: solo el nombre de PANEL_HOSTS entra; cualquier otro Host, 403
+    process.env.PANEL_HOSTS = "pc.tail1.ts.net";
+    const conHost = (host) => new Promise((ok, mal) => http.get({ host: "127.0.0.1", port: puerto, path: "/", headers: { host } }, (r) => { r.resume(); ok(r.statusCode); }).on("error", mal));
+    assert.deepStrictEqual([await conHost("pc.tail1.ts.net"), await conHost("evil.com")], [200, 403]);
+    delete process.env.PANEL_HOSTS;
+    globalThis.fetch = antes;
+    srv.close();
+    assert.strictEqual(html[0], 200);
+    assert.match(html[1], /http-equiv="refresh"[\s\S]*No pude leer el Calendar[\s\S]*\+5492619990000/);
+    avisos.listo(avisos.pendientes()[0].id);
+  }
 
   const [juan, ana] = turnos;
   assert.match(recordatorio(juan.tel, juan), /Te recordamos que el .* tenés turno con la Dra\. Prueba[\s\S]*1\) Sí, voy\n2\) No puedo ir/);
@@ -346,6 +419,70 @@ assert.strictEqual(clasificar(msg({}, { ephemeralMessage: { message: { conversat
   assert.ok(!evs.some((x) => x.id === "b1"));
   // Otro teléfono no puede confirmar ni cancelar un turno ajeno
   assert.deepStrictEqual(await agenda.cancelar("5492619999999", "m1"), { error: "No encontré ese turno a nombre de este teléfono." });
+}
+
+// Bandeja: chats guardados para verlos y responderlos desde el panel
+{
+  const bandeja = await import("./lib/bandeja.js");
+  const { paginaChat, paginaChats, servir } = await import("./lib/panel.js");
+  const estado = await import("./lib/estado.js");
+  const avisos = await import("./lib/avisos.js");
+  const http = await import("node:http");
+  const m = (id, message, o = {}) => ({ key: { remoteJid: "5492611112222@s.whatsapp.net", id, fromMe: false, ...o }, messageTimestamp: 1_800_000_000, pushName: "Ana", message });
+  assert.deepStrictEqual(bandeja.leer(m("a1", { conversation: "hola" })), { id: "a1", jid: "5492611112222@s.whatsapp.net", fromMe: false, at: 1_800_000_000_000, texto: "hola", nombre: "Ana" });
+  assert.strictEqual(bandeja.leer(m("a2", { imageMessage: { caption: "la orden" } })).texto, "📷 foto la orden"); // media: etiqueta, y no se descarta por vieja
+  assert.strictEqual(bandeja.leer(m("a3", { audioMessage: {} })).texto, "🎤 audio");
+  assert.strictEqual(bandeja.leer(m("a4", { reactionMessage: { text: "👍" } })), null);
+  assert.strictEqual(bandeja.leer({ ...m("a5", { conversation: "x" }), key: { remoteJid: "123@g.us", id: "a5" } }), null); // grupos no
+  assert.strictEqual(bandeja.leer(m("a6", { conversation: "yo" }, { fromMe: true })).nombre, null); // pushName propio no es el del paciente
+
+  const tel = "5492611112222", t0 = Date.now() - 60e3;
+  bandeja.guardar({ id: "p1", tel, at: t0 + 1000, de: "paciente", texto: "<img src=x onerror=alert(1)>", nombre: "<b>Ana</b>" });
+  // el eco de lo que mandó el panel llega como "celular": en cualquier orden queda "panel"
+  bandeja.guardar({ id: "r1", tel, at: t0 + 2000, de: "celular", texto: "hola Ana" });
+  bandeja.guardar({ id: "r1", tel, at: t0 + 2000, de: "panel", texto: "hola Ana", quien: "secre@ejemplo.com" });
+  bandeja.guardar({ id: "r2", tel, at: t0 + 3000, de: "panel", texto: "¿algo más?" });
+  bandeja.guardar({ id: "r2", tel, at: t0 + 3000, de: "celular", texto: "¿algo más?" });
+  assert.deepStrictEqual(bandeja.mensajes(tel).map((x) => [x.id, x.de]), [["p1", "paciente"], ["r1", "panel"], ["r2", "panel"]]);
+  assert.strictEqual(bandeja.chats()[0].esperando, false); // el último es nuestro
+  bandeja.guardar({ id: "p2", tel, at: t0 + 4000, de: "paciente", texto: "gracias" });
+  assert.deepStrictEqual(bandeja.chats().map((c) => [c.tel, c.esperando, c.nombre]), [[tel, true, "<b>Ana</b>"]]);
+  // vence a los BANDEJA_DIAS
+  bandeja.guardar({ id: "viejo", tel: "5492613333333", at: Date.now() - 91 * 86400e3, de: "paciente", texto: "x" });
+  assert.strictEqual(bandeja.mensajes("5492613333333").length, 0);
+
+  // todo lo que escribe el paciente va escapado (la página puede mandar WhatsApp)
+  const html = paginaChat({ tel, msgs: bandeja.mensajes(tel) }) + paginaChats({ lista: bandeja.chats() });
+  assert.doesNotMatch(html, /<img|<b>Ana/);
+  assert.match(html, /&#60;img src=x/);
+  assert.match(html, /💻 panel · secre@ejemplo\.com/);
+
+  // Responder desde el panel: manda, pausa el bot en ese chat y resuelve sus avisos
+  const mandados = [];
+  const puerto = 30000 + Math.floor(Math.random() * 20000);
+  const srv = servir({ puerto, enviar: async () => "", responder: async (t, texto, quien) => { mandados.push([t, texto, quien]); } });
+  await new Promise((r) => setTimeout(r, 200));
+  const post = (path, body, headers = { origin: `http://127.0.0.1:${puerto}` }) => new Promise((ok, mal) => {
+    const r = http.request({ host: "127.0.0.1", port: puerto, path, method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", "tailscale-user-login": "doc@ejemplo.com", ...headers } }, (x) => { x.resume(); ok([x.statusCode, x.headers.location]); });
+    r.on("error", mal); r.end(body);
+  });
+  const get = (path) => new Promise((ok, mal) => http.get({ host: "127.0.0.1", port: puerto, path }, (r) => { let b = ""; r.on("data", (c) => (b += c)); r.on("end", () => ok([r.statusCode, b])); }).on("error", mal));
+  avisos.avisar(tel, "falló la IA");
+  assert.strictEqual(estado.pausado(tel), false);
+  assert.deepStrictEqual(await post("/responder", `tel=${tel}&texto=${encodeURIComponent("Hola, ¿cómo estás?")}`), [303, `/chat?tel=${tel}`]);
+  assert.deepStrictEqual(mandados, [[tel, "Hola, ¿cómo estás?", "doc@ejemplo.com"]]);
+  assert.strictEqual(estado.pausado(tel), true);
+  assert.ok(!avisos.pendientes().some((a) => a.tel === tel));
+  assert.match((await get(`/chat?tel=${tel}`))[1], /Bot en pausa[\s\S]*Reactivar bot/);
+  assert.deepStrictEqual(await post("/bot", `tel=${tel}&accion=reactivar`), [303, `/chat?tel=${tel}`]);
+  assert.strictEqual(estado.pausado(tel), false);
+  assert.deepStrictEqual((await post("/responder", `tel=${tel}&texto=hola`, {}))[0], 403); // sin Origin (otra web) no manda
+  assert.deepStrictEqual((await post("/responder", "tel=abc&texto=hola"))[0], 400);
+  assert.strictEqual(mandados.length, 1);
+  const [st, frag] = await get(`/chat/msgs?tel=${tel}`);
+  assert.strictEqual(st, 200); assert.match(frag, /^<div class="msg"/); assert.doesNotMatch(frag, /<html/);
+  assert.match((await get("/chats"))[1], /\(1\) Chats[\s\S]*1 esperando respuesta/);
+  srv.close();
 }
 
 console.log("ok");
